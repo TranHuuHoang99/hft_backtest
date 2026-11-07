@@ -66,3 +66,8 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# generated market data & tool caches
+*.csv
+.rows_per_day
+__pycache__/

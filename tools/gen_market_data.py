@@ -37,8 +37,25 @@ Output columns:
 
 Usage:
   python gen_market_data.py                       # ~5 GB, 30 sessions
-  python gen_market_data.py --target-gb 0.2 --sessions 3 --out tiny.csv
+  python gen_market_data.py 1GB                   # positional target size too
+  python gen_market_data.py 1GB --sessions 5      # how far back to spread it
+  python gen_market_data.py 6B                    # 6 bytes (tiny smoke test)
+  python gen_market_data.py 80KB --out small.csv
+  python gen_market_data.py 100MB --dirty 0.4 --seed-file .rows_seed
   python gen_market_data.py --verify out.csv      # sanity-check a file
+
+Size suffixes: B, KB, MB, GB, TB (decimal, 1KB = 1000 bytes; also KiB/MiB/
+GiB/TiB for powers of two). A bare number is gigabytes, as before.
+
+Dirty rows: a share of the rows are pushed into the structural CSV cases a
+hand-written parser must survive (comma inside a quoted field, ""-escaped
+quotes, empty fields at the row boundaries). The extra columns
+buyer_ref,seller_ref,venue_note are added to the header for them; clean rows
+are padded with empty values. See gen_dirty.py for the full rule set.
+
+--verify checks a file structurally (every line parses under those rules);
+rows that carry no quoting are additionally checked against the market
+invariants (bid < ask, tick alignment, price band).
 """
 
 from __future__ import annotations
@@ -48,10 +65,14 @@ import bisect
 import math
 import os
 import random
+import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gen_dirty  # noqa: E402  (sibling module, same directory)
 
 EPOCH = datetime(1970, 1, 1)
 US = timedelta(microseconds=1)
@@ -207,11 +228,17 @@ class TickerState:
 
 def gen_session(day: date, afternoon: bool, nominal: float,
                 rng: random.Random, states: list[TickerState],
-                day_mult: float) -> tuple[str, int]:
+                day_mult: float, cap: int | None = None
+                ) -> tuple[str, int]:
     """Simulate one session (morning or afternoon) for every ticker.
 
     Returns (text_body, n_rows). `nominal` is the requested base arrival
-    count; emitted rows are ~nominal * uplift.
+    count; emitted rows are ~nominal * uplift. `cap` limits the rows emitted
+    per ticker: a ticker stops once it has produced `cap` rows of its own, so
+    every row that could appear among the first `cap` of the merged, sorted
+    stream is still generated (used by gen_market_data_lines.py to stop early
+    when only the first N rows are wanted). The first cap rows of the sorted
+    output are identical to an uncapped run's first cap rows.
     """
     curve = CURVE_A if afternoon else CURVE_M
     t0, t1 = (AFTERNOON if afternoon else MORNING)
@@ -248,6 +275,7 @@ def gen_session(day: date, afternoon: bool, nominal: float,
         pre = ",%s,%s,%s," % (date_str, "OTC" if st.is_otc else "HOSE", st.ticker)
 
         t = start_us + int(rng.expovariate(3.0) * 1e6)   # first print
+        emitted = 0
         rand = rng.random
         gauss = rng.gauss
         expo = rng.expovariate
@@ -325,6 +353,7 @@ def gen_session(day: date, afternoon: bool, nominal: float,
                          "%d%s%d,%d,%d,%s,%d,%d,%d,%d"
                          % (t, pre, st.ref, st.px, vol, side,
                             bid, ask, DEPTH[bvi], DEPTH[avi])))
+            emitted += 1
 
             if st.burst_arr == 0 and rand() < BURST_P:
                 st.burst_arr = BURST_LEN + int(rand() * BURST_LEN)
@@ -333,10 +362,127 @@ def gen_session(day: date, afternoon: bool, nominal: float,
                 nxt = t + 1
             t = nxt
 
+            if cap is not None and emitted >= cap:
+                # Stop only AFTER the full iteration has drawn its randoms,
+                # so every later ticker's stream is unchanged and the first
+                # `cap` sorted rows match an uncapped run exactly.
+                break
+
         st.last_close = st.px
 
     rows.sort()
+    if cap is not None and len(rows) > cap:
+        del rows[cap:]                     # head is prefix-exact by construction
     return "\n".join(r[2] for r in rows), len(rows)
+
+
+# ---------------------------------------------------------------------------
+# Size arguments & dirty rendering (shared with gen_market_data_lines.py)
+# ---------------------------------------------------------------------------
+
+_SIZE_UNITS = {
+    "": 1e9, "b": 1, "kb": 1e3, "mb": 1e6, "gb": 1e9, "tb": 1e12,
+    "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4,
+}
+_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-z]*)\s*$", re.I)
+
+
+def parse_size(text: str) -> int:
+    """'1GB' / '6B' / '80KB' / '100MB' / '1.5GiB' -> bytes. Bare = gigabytes."""
+    m = _SIZE_RE.match(str(text))
+    if not m:
+        raise argparse.ArgumentTypeError(
+            "bad size %r (examples: 6B, 80KB, 100MB, 1GB, 1.5GiB)" % text)
+    unit = m.group(2).lower()
+    if unit not in _SIZE_UNITS:
+        raise argparse.ArgumentTypeError("unknown size unit %r in %r"
+                                         % (m.group(2), text))
+    return int(float(m.group(1)) * _SIZE_UNITS[unit])
+
+
+def fmt_bytes(n: float) -> str:
+    for unit, div in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if n >= div:
+            return "%.2f %s" % (n / div, unit)
+    return "%d B" % n
+
+
+def load_rows_seed(path: str) -> int:
+    """Load a pinned prints/day (see --seed-file) so runs share one density.
+
+    Without a pin, every size calibrates its own prints/day, so two runs with
+    different targets produce different row densities. With a pin, files of
+    different sizes share the same rows/day (and, with the same --seed, the
+    same per-day content).
+    """
+    if path and os.path.exists(path):
+        try:
+            with open(path, encoding="ascii") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            pass
+    return 0
+
+
+def save_rows_seed(path: str, rows_per_day: int) -> None:
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="ascii") as f:
+            f.write("%d\n" % rows_per_day)
+    except OSError:
+        pass
+
+
+def sweep_quoteless(line: str, core: list[str]) -> bool:
+    """Market invariants for a row with no quoting; True if the row is good.
+
+    Skipped for dirty rows: their numeric columns may hold vendor
+    annotations, so the invariants only apply to clean rows.
+    """
+    if '"' in line:
+        return True
+    try:
+        px, vol = int(core[5]), int(core[6])
+        bid, ask = int(core[8]), int(core[9])
+    except (ValueError, IndexError):
+        return False
+    if not (bid < ask and bid <= px < ask and vol > 0):
+        return False
+    if core[2] == "HOSE":
+        if px % tick_size(px) or vol % 100:
+            return False
+    return True
+
+
+def verify(path: str) -> int:
+    """Structural + market-invariant check of `path`, including ts ordering."""
+    bad, unsorted = gen_dirty.verify(path, core_check=sweep_quoteless,
+                                     check_sorted=True)
+    if unsorted:
+        print(f"  {unsorted:,} rows out of timestamp order")
+    return 0 if bad == 0 and unsorted == 0 else 1
+
+
+def render_dirty(body: str, rng: random.Random, p: float) -> str:
+    """Re-emit a batch of clean rows in place, dirtying roughly p of them.
+
+    Walking the body row by row (instead of touching the hot inner loop)
+    keeps generation speed the same as before for p = 0. Rows are processed
+    in sorted output order and `rng` is advanced only for rows that are
+    emitted, so truncating a batch at row k leaves the stream exactly where
+    the full batch would have it: short files are prefixes of long ones.
+    """
+    if p <= 0.0:
+        return body
+    out = []
+    for row in body.split("\n"):
+        if rng.random() < p:
+            out.append(gen_dirty.make_line(rng, row, 1.0)[0])
+        else:
+            out.append(gen_dirty.make_clean(row))
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -369,13 +515,31 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Generate a synthetic HOSE-style tick CSV (~5 GB by default).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--out", default="market_ticks.csv")
-    ap.add_argument("--target-gb", type=float, default=5.0)
-    ap.add_argument("--sessions", type=int, default=30)
+    ap.add_argument("target", nargs="?", metavar="SIZE",
+                    help="file size: 6B / 80KB / 100MB / 1GB (bare number = GB)")
+    ap.add_argument("--out", default=None,
+                    help="output path (default: market_ticks_<SIZE>.csv)")
+    ap.add_argument("--target-gb", type=float, default=None,
+                    help="file size in GB (legacy form of SIZE)")
+    ap.add_argument("--sessions", type=int, default=None,
+                    help="trading days to cover (default: 30, or as few as "
+                         "needed for small sizes)")
     ap.add_argument("--rows-per-day", type=int, default=0,
                     help="override the auto-calibrated nominal prints/day")
+    ap.add_argument("--seed-file", default="",
+                    help="pin the calibrated prints/day in this file so runs "
+                         "with different SIZE targets share one row density "
+                         "(e.g. .rows_per_day; '' disables pinning)")
+    ap.add_argument("--dirty", type=float, default=0.5,
+                    help="fraction of rows emitted with CSV structural "
+                         "complexity (quotes, escapes, empty fields); 0=off")
     ap.add_argument("--start", default="2026-08-03")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--no-retarget", action="store_true",
+                    help="sample at a constant prints/day instead of "
+                         "closed-loop retargeting per day; constant density is "
+                         "what keeps the first N rows identical across files "
+                         "(use together with --seed-file for exact prefixes)")
     ap.add_argument("--verify", metavar="CSV", default=None,
                     help="verify an existing file instead of generating")
     args = ap.parse_args()
@@ -383,49 +547,115 @@ def main() -> int:
     if args.verify:
         return verify(args.verify)
 
+    if not 0.0 <= args.dirty <= 1.0:
+        ap.error("--dirty must be between 0 and 1")
+
+    # ---- resolve target size ----
+    if args.target is not None:
+        try:
+            target_bytes = parse_size(args.target)
+        except argparse.ArgumentTypeError as e:
+            ap.error(str(e))
+        label = args.target.upper().replace(" ", "")
+    elif args.target_gb is not None:
+        target_bytes = int(args.target_gb * 1e9)
+        label = "%gGB" % args.target_gb
+    else:
+        target_bytes = int(5e9)
+        label = "5GB"
+    if target_bytes <= 0:
+        ap.error("target size must be positive")
+    out = args.out or "market_ticks_%s.csv" % label
+
     start = date.fromisoformat(args.start)
-    days = session_dates(start, args.sessions)
+    # ~140 B/row; never stretch a tiny file over 30 days (and a KB-sized file
+    # may only fit a handful of rows -- that is fine, it is a smoke test).
+    if args.sessions is not None:
+        sessions = max(1, args.sessions)
+    else:
+        days_needed = int(target_bytes / 140.0 / 2_000) + 1
+        # No point asking for more days than there are rows to fill them.
+        sessions = max(1, min(30, days_needed,
+                              max(1, int(target_bytes / 140.0))))
+    days = session_dates(start, sessions)
     t0 = time.perf_counter()
-    target_bytes = args.target_gb * 1e9
+
+    pinned = 0 if args.rows_per_day > 0 else load_rows_seed(args.seed_file)
+    if args.rows_per_day <= 0 and pinned > 0:
+        args.rows_per_day = pinned
+        print(f"  using pinned {pinned:,} prints/day from {args.seed_file}")
 
     if args.rows_per_day > 0:
         calib, bpr = measure(args.seed, 50_000, session_dates(start, 2))
     else:
         # Probe at production-scale density, then solve for the rows/day that
-        # lands on the size target.
+        # lands on the size target. Per-row bytes grow slightly when rows are
+        # dirty (the extra vendor columns), so inflate the budget accordingly.
         probe = session_dates(start, 4)
-        guess = int(target_bytes / 120.0 / args.sessions)
-        calib, bpr = measure(args.seed, guess, probe)
-        args.rows_per_day = max(1, int(target_bytes / bpr / args.sessions / calib))
+        guess = int(target_bytes / 120.0 / max(sessions, 1))
+        calib, bpr = measure(args.seed, max(guess, 1), probe)
+        if bpr <= 0:                       # probe too small to measure B/row
+            calib, bpr = 1.0, 130.0
+        else:
+            bpr *= 1.0 + 0.22 * args.dirty
+        args.rows_per_day = max(
+            1, int(target_bytes / bpr / sessions / calib))
+        save_rows_seed(args.seed_file, args.rows_per_day)
         print(f"  calibration: uplift {calib:.3f}, {bpr:.1f} B/row -> "
-              f"{args.rows_per_day:,} nominal prints/day")
+              f"{args.rows_per_day:,} nominal prints/day"
+              + (f" (pinned to {args.seed_file})" if args.seed_file else ""))
 
-    print(f"Generating {args.out}: ~{args.target_gb:.1f} GB, {len(days)} sessions, "
-          f"{args.rows_per_day:,} nominal prints/day, start {args.start}, seed {args.seed}")
+    print(f"Generating {out}: {label} target ({fmt_bytes(target_bytes)}), "
+          f"{len(days)} sessions, {args.rows_per_day:,} nominal prints/day, "
+          f"dirty {args.dirty:.0%}, start {args.start}, seed {args.seed}")
 
     rnd = random.Random(args.seed)
+    dirty_rng = random.Random(args.seed ^ 0x5EED)
     states = [TickerState(inst, k) for k, inst in enumerate(INSTRUMENTS)]
     written = 0
+    truncated = False
     target_per_day = args.rows_per_day
 
-    with open(args.out, "w", newline="", encoding="ascii", buffering=1 << 23) as f:
-        f.write(HEADER)
-        size = len(HEADER)
+    with open(out, "w", newline="", encoding="ascii", buffering=1 << 23) as f:
+        f.write((gen_dirty.DIRTY_HEADER if args.dirty > 0
+                 else gen_dirty.CLEAN_HEADER) + "\n")
+        size = f.tell()
+        if size >= target_bytes:               # target smaller than the header
+            print(f"  note: header alone is {size} B, target {target_bytes} B")
         for di, d in enumerate(days):
+            if truncated or size >= target_bytes:
+                break
             day_mult = math.exp(0.12 * rnd.gauss(0, 1))   # one per day, both sessions
             prev_total, day_bytes = written, 0
             for afternoon in (False, True):
                 share = (MASS_A if afternoon else MASS_M) / (MASS_M + MASS_A)
                 text, n = gen_session(d, afternoon, target_per_day * share,
                                       rnd, states, day_mult)
-                f.write(text)
-                f.write("\n")
-                day_bytes += len(text) + 1
+                text = render_dirty(text, dirty_rng, args.dirty)
+                chunk = text + "\n"
+                # Small targets: never overshoot, cut at a line boundary.
+                room = target_bytes - (size + day_bytes)
+                if len(chunk) > room:
+                    keep = chunk[:max(0, room)].rfind("\n")
+                    if keep > 0:
+                        chunk = chunk[:keep + 1]
+                        n = chunk.count("\n")
+                        truncated = True
+                    else:
+                        n = 0
+                    if not chunk:
+                        truncated = True
+                        break
+                f.write(chunk)
+                day_bytes += len(chunk)
                 written += n
+                if truncated:
+                    break
             size += day_bytes
             # Closed-loop retarget: correct half the observed drift on what is
             # left, so the final size lands within a few percent of target.
-            if di < len(days) - 1 and written and target_bytes > 0:
+            if di < len(days) - 1 and written and target_bytes > 0 \
+                    and not args.no_retarget:
                 per_row = size / written
                 projected = size + (len(days) - di - 1) * per_row * target_per_day * calib
                 drift = target_bytes / max(projected, 1) - 1.0
@@ -435,45 +665,11 @@ def main() -> int:
                   f"{size / 1e9:5.2f} GB  {el:6.0f}s  "
                   f"({written / max(el, 1e-9) / 1e3:.0f}k rows/s)")
 
-    size_gb = os.path.getsize(args.out) / 1e9
-    print(f"\nDone: {args.out}  {written:,} rows  {size_gb:.2f} GB  "
+    size_b = os.path.getsize(out)
+    print(f"\nDone: {out}  {written:,} rows  {fmt_bytes(size_b)} "
+          f"({size_b / max(target_bytes, 1):.1%} of target)  "
           f"{time.perf_counter() - t0:.0f}s")
     return 0
-
-
-def verify(path: str) -> int:
-    import csv
-    n = bad = unsorted = 0
-    prev_ts = -1
-    with open(path, newline="", encoding="ascii") as f:
-        for row in csv.DictReader(f):
-            n += 1
-            try:
-                ts = int(row["ts_us"])
-                match = int(row["match_price"])
-                bid = int(row["bid_price"])
-                ask = int(row["ask_price"])
-                ref = int(row["ref_price"])
-                vol = int(row["match_volume"])
-            except (KeyError, ValueError):
-                bad += 1
-                continue
-            if ts < prev_ts:
-                unsorted += 1
-            prev_ts = ts
-            if bid >= ask or bid > match or ask <= match:
-                bad += 1
-            if row["exchange"] == "HOSE":
-                if match % tick_size(match):
-                    bad += 1
-                if vol % 100:
-                    bad += 1
-                if not (ref * 0.93 <= match <= ref * 1.07):
-                    bad += 1
-            if n % 10_000_000 == 0:
-                print(f"  ... {n:,} rows")
-    print(f"{path}: {n:,} rows, {bad:,} constraint violations, {unsorted:,} out-of-order")
-    return 0 if bad == 0 and unsorted == 0 else 1
 
 
 if __name__ == "__main__":
