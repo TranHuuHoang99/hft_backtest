@@ -10,66 +10,44 @@
 #define pi acos(-1.0)
 using namespace std;
 
-class Solution {
-public:
-    int getNumberOfBacklogOrders(vector<vector<int>>& orders) {
-        map<int,int> orders_map[2]; // 0 buy, 1 sell
-        set<int> orders_set[2];
-        for (auto vec : orders) {
-            int price = vec[0];
-            int amount = vec[1];
-            int type = vec[2];
-            if (type == 0) {
-                while (amount > 0 && !orders_set[1-type].empty()) {
-                    auto it = orders_set[1-type].begin();
-                    if (price >= *it) {
-                        int diff = min(orders_map[1-type][*it], amount);
-                        orders_map[1-type][*it] -= diff;
-                        amount -= diff;
-                        if (orders_map[1-type][*it] == 0) {
-                            orders_set[1-type].erase(it);
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                if (amount > 0) {
-                    orders_set[type].insert(price);
-                    orders_map[type][price] += amount;
-                }
-            } else {
-                while (amount > 0 && !orders_set[1-type].empty()) {
-                    auto it = prev(orders_set[1-type].end());
-                    if (price <= *it) {
-                        int diff = min(orders_map[1-type][*it], amount);
-                        orders_map[1-type][*it] -= diff;
-                        amount -= diff;
-                        if (orders_map[1-type][*it] == 0) {
-                            orders_set[1-type].erase(it);
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                if (amount > 0) {
-                    orders_set[type].insert(price);
-                    orders_map[type][price] += amount;
-                }
-            }
-        }
-        long long ret = 0ll;
-        long long mod = 1e9+7;
-        for (int i = 0; i <= 1; i++) {
-            for (pair<int,int> p : orders_map[i]) {
-                ret = (ret % mod + p.second % mod) % mod;
-            }
-        }
-        return ret;
+struct node_value {
+    int price;
+    int seq;
+    node_value(void) {
+        price = INT32_MAX;
+        seq = 0;
     }
 };
-
+vector<node_value> arr(10);
+struct node_index {
+    int idx;
+    node_index(const int _idx) {
+        idx = _idx;
+    }
+    bool operator < (const node_index& other) const {
+        if (arr[idx].price == arr[other.idx].price) {
+            return arr[idx].seq > arr[other.idx].seq;
+        }
+        // take the order with higher price
+        return arr[idx].price < arr[other.idx].price;
+    }
+};
+priority_queue<node_index> pq;
 void solve(void) {
-
+    for (int i = 0; i < 10; i++) {
+        node_value temp;
+        temp.price = i;
+        temp.seq = 10;
+        arr[i] = temp;
+        pq.emplace(node_index(i));
+    }
+    while (!pq.empty()) {
+        node_index cur_node_idx = pq.top();
+        pq.pop();
+        const int& idx = cur_node_idx.idx;
+        const node_value& cur_val = arr[idx];
+        cout << cur_val.price << ' ' << cur_val.seq << '\n';
+    }
 }
 signed main(void) {
     ios::sync_with_stdio(false);
