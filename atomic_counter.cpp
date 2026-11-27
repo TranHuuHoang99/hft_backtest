@@ -16,15 +16,19 @@ public:
     }
 
     int incrementAndGet() {
-        return 0;
+        int cur_val = m_cnt.load(memory_order_acquire);
+        while (!m_cnt.compare_exchange_weak(cur_val, cur_val + 1, memory_order_release, memory_order_relaxed));
+        return cur_val + 1;
     }
 
     int addAndGet(int delta) {
-        return 0;
+        int cur_val = m_cnt.load(memory_order_acquire);
+        while (!m_cnt.compare_exchange_weak(cur_val, cur_val + delta, memory_order_release, memory_order_relaxed));
+        return cur_val + delta;
     }
 
     int get() {
-        return 0;
+        return m_cnt.load();
     }
 private:
     atomic<int> m_cnt;

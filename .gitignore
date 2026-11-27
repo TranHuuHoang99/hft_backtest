@@ -1,2 +1,6 @@
+# binary
+*.out
+*.exe
+
 # vscode folder
 .vscode
